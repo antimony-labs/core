@@ -1,0 +1,100 @@
+name: Core API Edge Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: core-api-edge-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: fleet_api
+  RELEASE_ASSET: fleet_api-x86_64-unknown-linux-gnu.tar.gz
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.task.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - name: workspace-tests
+            command: cargo test --all-features --workspace --locked
+          - name: release-build
+            command: cargo build --release --workspace --locked
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run ${{ matrix.task.name }}
+        run: ${{ matrix.task.command }}
+
+  release:
+    name: Publish GitHub release
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --workspace --locked
+
+      - name: Package release asset
+        id: package
+        run: |
+          set -euo pipefail
+
+          short_sha="${GITHUB_SHA::12}"
+          tag="core-api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${short_sha}"
+
+          mkdir -p dist
+          cp "target/release/${BINARY_NAME}" "dist/${BINARY_NAME}"
+          tar -C dist -czf "dist/${RELEASE_ASSET}" "${BINARY_NAME}"
+          sha256sum "dist/${RELEASE_ASSET}" > "dist/${RELEASE_ASSET}.sha256"
+
+          {
+            echo "tag=${tag}"
+            echo "asset=dist/${RELEASE_ASSET}"
+            echo "checksum=dist/${RELEASE_ASSET}.sha256"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-api-release
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: Core API ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}

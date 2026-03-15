@@ -1,0 +1,9 @@
+[Unit]
+Description=Update Antimony Core API from GitHub Releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/antimony/core-api-release-updater.env
+ExecStart=/usr/local/sbin/update-core-api-from-release.sh
