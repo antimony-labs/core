@@ -10,7 +10,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use shared_types::NodeTelemetry;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -53,12 +53,14 @@ struct TelemetryHistoryResponse {
 #[tokio::main]
 async fn main() {
     // Initialize DB Pool
-    let db_url = "sqlite://telemetry.db";
+    let connect_options = SqliteConnectOptions::new()
+        .filename("telemetry.db")
+        .create_if_missing(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(db_url)
+        .connect_with(connect_options)
         .await
-        .expect("Failed to bind sqlite memory pool");
+        .expect("Failed to initialize sqlite pool");
 
     // Run migrations
     sqlx::migrate!("./migrations")
