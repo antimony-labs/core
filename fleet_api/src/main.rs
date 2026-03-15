@@ -75,6 +75,10 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if req.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(req).await);
+    }
+
     // 1. Extract the Authorization header
     let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
     let token = match auth_header {
