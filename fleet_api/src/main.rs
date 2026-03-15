@@ -14,16 +14,20 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::LazyLock,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 // App State holding the SQLite Connection Pool
 type AppState = SqlitePool;
+const DB_POOL_MAX_CONNECTIONS: u32 = 5;
 const DEFAULT_HISTORY_HOURS: u64 = 24;
 const MAX_HISTORY_HOURS: u64 = 24 * 7;
 const RETENTION_DAYS: i64 = 14;
 const CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
+static SERVER_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+static SERVER_STARTED_AT_SEC: LazyLock<i64> = LazyLock::new(current_timestamp_sec);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -31,11 +35,34 @@ struct Claims {
     exp: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
+struct DatabasePoolHealth {
+    max_connections: u32,
+    open_connections: u32,
+    idle_connections: u32,
+    active_connections: u32,
+    active_connection_saturation_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildInfo {
+    target_arch: &'static str,
+    target_os: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_sha: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_tag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
     repository: &'static str,
     version: &'static str,
+    started_at_sec: i64,
+    uptime_secs: u64,
+    db_pool: DatabasePoolHealth,
+    build: BuildInfo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,12 +79,15 @@ struct TelemetryHistoryResponse {
 
 #[tokio::main]
 async fn main() {
+    LazyLock::force(&SERVER_START);
+    LazyLock::force(&SERVER_STARTED_AT_SEC);
+
     // Initialize DB Pool
     let connect_options = SqliteConnectOptions::new()
         .filename("telemetry.db")
         .create_if_missing(true);
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(DB_POOL_MAX_CONNECTIONS)
         .connect_with(connect_options)
         .await
         .expect("Failed to initialize sqlite pool");
@@ -103,12 +133,45 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health_handler() -> Json<HealthResponse> {
+async fn health_handler(State(pool): State<AppState>) -> Json<HealthResponse> {
+    let open_connections = pool.size();
+    let idle_connections = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX);
+    let active_connections = open_connections.saturating_sub(idle_connections);
+    let saturation_pct = if DB_POOL_MAX_CONNECTIONS == 0 {
+        0.0
+    } else {
+        (active_connections as f64 / DB_POOL_MAX_CONNECTIONS as f64) * 100.0
+    };
+
     Json(HealthResponse {
         status: "online",
-        repository: "antimony-labs/core",
+        repository: option_env!("GITHUB_REPOSITORY").unwrap_or("antimony-labs/core"),
         version: env!("CARGO_PKG_VERSION"),
+        started_at_sec: *SERVER_STARTED_AT_SEC,
+        uptime_secs: SERVER_START.elapsed().as_secs(),
+        db_pool: DatabasePoolHealth {
+            max_connections: DB_POOL_MAX_CONNECTIONS,
+            open_connections,
+            idle_connections,
+            active_connections,
+            active_connection_saturation_pct: saturation_pct,
+        },
+        build: BuildInfo {
+            target_arch: std::env::consts::ARCH,
+            target_os: std::env::consts::OS,
+            git_sha: option_env!("GITHUB_SHA"),
+            release_tag: compiled_release_tag(),
+        },
     })
+}
+
+fn compiled_release_tag() -> Option<String> {
+    let run_id = option_env!("GITHUB_RUN_ID")?;
+    let run_attempt = option_env!("GITHUB_RUN_ATTEMPT")?;
+    let git_sha = option_env!("GITHUB_SHA")?;
+    let short_sha = git_sha.get(..12).unwrap_or(git_sha);
+
+    Some(format!("core-api-{run_id}-{run_attempt}-{short_sha}"))
 }
 
 async fn auth_middleware(
@@ -297,7 +360,7 @@ mod tests {
     // Helper function to build the Router for testing
     async fn build_test_app() -> (Router, SqlitePool) {
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(DB_POOL_MAX_CONNECTIONS)
             .connect("sqlite::memory:")
             .await
             .unwrap();
@@ -326,6 +389,7 @@ mod tests {
         .unwrap();
 
         let public_app = Router::new()
+            .route("/health", get(health_handler))
             .route("/telemetry", get(get_telemetry))
             .route(
                 "/telemetry",
@@ -345,6 +409,57 @@ mod tests {
             .merge(protected_app)
             .layer(middleware::from_fn(cors_middleware));
         (app, pool)
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_pool_metrics_and_build_metadata() {
+        let (app, pool) = build_test_app().await;
+
+        let req = Request::builder()
+            .method(http::Method::GET)
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["status"], "online");
+        assert_eq!(payload["repository"], "antimony-labs/core");
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+        assert!(payload["started_at_sec"].as_i64().is_some());
+        assert!(payload["uptime_secs"].as_u64().is_some());
+        assert_eq!(
+            payload["db_pool"]["max_connections"],
+            DB_POOL_MAX_CONNECTIONS
+        );
+        assert_eq!(payload["db_pool"]["open_connections"], pool.size());
+        let open_connections = payload["db_pool"]["open_connections"].as_u64().unwrap();
+        let idle_connections = payload["db_pool"]["idle_connections"].as_u64().unwrap();
+        let active_connections = payload["db_pool"]["active_connections"].as_u64().unwrap();
+        let saturation_pct = payload["db_pool"]["active_connection_saturation_pct"]
+            .as_f64()
+            .unwrap();
+
+        assert_eq!(
+            idle_connections,
+            u32::try_from(pool.num_idle()).unwrap_or(u32::MAX) as u64
+        );
+        assert_eq!(
+            active_connections,
+            open_connections.saturating_sub(idle_connections)
+        );
+        assert!(
+            (saturation_pct
+                - ((active_connections as f64 / DB_POOL_MAX_CONNECTIONS as f64) * 100.0))
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(payload["build"]["target_arch"], std::env::consts::ARCH);
+        assert_eq!(payload["build"]["target_os"], std::env::consts::OS);
     }
 
     #[tokio::test]
