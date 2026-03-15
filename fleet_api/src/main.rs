@@ -40,12 +40,21 @@ struct HealthResponse {
 async fn main() {
     let state = Arc::new(RwLock::new(HashMap::new()));
 
-    // Build the application
-    let app = Router::new()
+    // Public routes (No Auth)
+    let public_app = Router::new()
         .route("/health", get(health_handler))
-        .route("/telemetry", get(get_telemetry).post(post_telemetry.layer(middleware::from_fn_with_state(state.clone(), auth_middleware))))
-        .with_state(state.clone())
-        .layer(CorsLayer::permissive());
+        .route("/telemetry", get(get_telemetry))
+        .route("/telemetry", axum::routing::options(|| async { axum::http::StatusCode::OK }))
+        .with_state(state.clone());
+
+    // Protected routes (Require JWT Auth)
+    let protected_app = Router::new()
+        .route("/telemetry", post(post_telemetry))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state.clone());
+
+    // Merge them into one application and add permissive CORS for Next.js browser requests
+    let app = public_app.merge(protected_app).layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     println!("Fleet Core API running on http://{}", addr);
@@ -124,10 +133,17 @@ mod tests {
     // Helper function to build the Router for testing
     fn build_test_app() -> Router {
         let state = Arc::new(RwLock::new(HashMap::new()));
-        Router::new()
-            .route("/telemetry", get(get_telemetry).post(post_telemetry.layer(middleware::from_fn_with_state(state.clone(), auth_middleware))))
-            .with_state(state)
-            .layer(CorsLayer::permissive())
+        let public_app = Router::new()
+            .route("/telemetry", get(get_telemetry))
+            .route("/telemetry", axum::routing::options(|| async { axum::http::StatusCode::OK }))
+            .with_state(state.clone());
+
+        let protected_app = Router::new()
+            .route("/telemetry", post(post_telemetry))
+            .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .with_state(state);
+
+        public_app.merge(protected_app).layer(CorsLayer::permissive())
     }
 
     #[tokio::test]
