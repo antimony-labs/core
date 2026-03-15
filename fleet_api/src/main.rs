@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     sync::Arc,
 };
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{CorsLayer, Any};
 use tokio::sync::RwLock;
 use axum::{
     extract::Request,
@@ -53,8 +53,13 @@ async fn main() {
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     // Merge them into one application and add permissive CORS for Next.js browser requests
-    let app = public_app.merge(protected_app).layer(CorsLayer::permissive());
+    let app = public_app.merge(protected_app).layer(cors);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     println!("Fleet Core API running on http://{}", addr);
@@ -143,7 +148,12 @@ mod tests {
             .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
             .with_state(state);
 
-        public_app.merge(protected_app).layer(CorsLayer::permissive())
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
+        public_app.merge(protected_app).layer(cors)
     }
 
     #[tokio::test]
